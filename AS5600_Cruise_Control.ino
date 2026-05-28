@@ -1,5 +1,5 @@
 /*
- * AS5600_Cruise_Control.ino
+ * HG HIGH RPM Version
  *
  * Reads rotational speed (RPM) from an AS5600 magnetic encoder over I2C.
  * A proportional controller compares measured RPM to a target setpoint
@@ -11,7 +11,6 @@
  *   - Servo signal output: pin D5
  *   - R/C input: pin D3 (interrupt-capable)
  *
- * Wiring note: Pull-up resistors (4.7 kΩ) on SDA/SCL are required.
  */
 
 #include <Wire.h>
@@ -28,8 +27,8 @@ static const uint8_t AS5600_REG_ANGLE  = 0x0C;  // 0x0C (high), 0x0D (low)
 // Servo / PWM constants
 // ---------------------------------------------------------------------------
 static const uint8_t SERVO_PIN      = 5;
-static const int     SERVO_MIN_US   = 1615;  // 1615 minimum throttle for driving
-static const int     SERVO_MAX_US   = 1650;  // 1645 maximum throttle for driving
+static const int     SERVO_MIN_US   = 1590;  // 1615 for danchee
+static const int     SERVO_MAX_US   = 1750;  // 1650 for danchee
 static const int     SERVO_NEUTRAL  = 1500;  //  neutral 
 
 // ---------------------------------------------------------------------------
@@ -40,29 +39,33 @@ static const int RC_ENABLE_MIN_US    = 1510;
 static const int RC_FAST_DROP_US     = 1520;  // below this, throttle snaps to neutral instantly
 static const int     RC_RPM_MIN_US   = 1520;   // RC pulse → minimum target RPM
 static const int     RC_RPM_MAX_US   = 2000;   // RC pulse → maximum target RPM
-static const float   TARGET_RPM_MIN  = 100.0f; // RPM at RC_RPM_MIN_US
-static const float   TARGET_RPM_MAX  = 150.0f; // RPM at RC_RPM_MAX_US
+static const float   TARGET_RPM_MIN  = 700.0f; // RPM at RC_RPM_MIN_US - 100 for danchee
+static const float   TARGET_RPM_MAX  = 5000.0f; // RPM at RC_RPM_MAX_US - 150 for danchee
 
 // ---------------------------------------------------------------------------
 // Controller tuning
 // ---------------------------------------------------------------------------
-float Kp             = 5.0f;   // proportional gain (µs per RPM of error)
+float Kp             = 0.5f;   // proportional gain (µs per RPM of error)
 float targetRPM      = TARGET_RPM_MIN;  // cruise setpoint (RPM), updated each loop from RC input
 
 // ---------------------------------------------------------------------------
 // Loop timing
 // ---------------------------------------------------------------------------
-static const uint32_t LOOP_MS = 20;   // control loop period (ms) → 50 Hz
+static const uint32_t LOOP_MS = 5;    // control loop period (ms) → 200 Hz
+                                       // At 5 ms, aliasing limit is ~6000 RPM
 
 // ---------------------------------------------------------------------------
 // Globals
 // ---------------------------------------------------------------------------
 Servo throttleServo;
 
-uint16_t prevAngle      = 0;
-uint32_t prevTimeMs     = 0;
-float    measuredRPM    = 0.0f;
-bool     controlEnabled = false;  // toggled by button
+uint16_t lastSampledAngle  = 0;    // angle from the most recent I2C read
+int32_t  accumulatedCounts = 0;    // sum of per-sample deltas since last control tick
+uint32_t prevTimeMs        = 0;
+uint32_t prevSerialMs      = 0;    // throttle serial telemetry independently
+static const uint32_t SERIAL_MS = 50;  // telemetry print interval (ms)
+float    measuredRPM       = 0.0f;
+bool     controlEnabled    = false;
 
 // Servo output filter
 float filteredPulseUs   = SERVO_NEUTRAL;
@@ -70,11 +73,23 @@ const float FILTER_ALPHA = 1.0f; // 0.0 = no response, 1.0 = no filtering
 
 // Slew rate limiter on servo output
 // Maximum rate of change of the servo pulse width in µs per millisecond.
-static const float SLEW_RATE_MAX_US_PER_MS = 0.035f;  // µs/ms — tune as needed
+static const float SLEW_RATE_MAX_US_PER_MS = 100.0f;  // 0.035 for dancehh - µs/ms — tune as needed
 float slewedPulseUs = SERVO_NEUTRAL;
 
-// R/C input state
-int rcPulseUs = 1500;
+// R/C input state — captured by interrupt, never by blocking pulseIn
+volatile uint32_t rcRiseUs  = 0;
+volatile int      rcPulseRaw = 1500;  // updated in ISR
+int rcPulseUs = 1500;                 // snapshot read in loop
+
+void rcISR()
+{
+    if (digitalRead(RC_INPUT_PIN) == HIGH) {
+        rcRiseUs = micros();
+    } else {
+        uint32_t w = micros() - rcRiseUs;
+        if (w > 900 && w < 2100) rcPulseRaw = (int)w;
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Read raw 12-bit angle from AS5600 (0–4095)
@@ -110,18 +125,12 @@ bool magnetDetected()
 }
 
 // ---------------------------------------------------------------------------
-// Compute RPM from angle delta, handling 12-bit rollover
+// Compute RPM from accumulated counts over a known elapsed time.
+// counts is an int32_t so multi-revolution accumulation never overflows.
 // ---------------------------------------------------------------------------
-float computeRPM(uint16_t currentAngle, uint16_t previousAngle, float elapsedMs)
+float computeRPM(int32_t counts, float elapsedMs)
 {
-    int16_t delta = (int16_t)currentAngle - (int16_t)previousAngle;
-
-    // Correct for 12-bit (4096-count) rollover
-    if (delta >  2048) delta -= 4096;
-    if (delta < -2048) delta += 4096;
-
-    // RPM = (counts / 4096 counts-per-rev) * (60000 ms/min / elapsed ms)
-    return ((float)delta / 4096.0f) * (60000.0f / elapsedMs);
+    return ((float)counts / 4096.0f) * (60000.0f / elapsedMs);
 }
 
 // ---------------------------------------------------------------------------
@@ -145,6 +154,7 @@ void setup()
     Wire.setClock(400000);  // 400 kHz fast mode
 
     pinMode(RC_INPUT_PIN, INPUT);
+    attachInterrupt(digitalPinToInterrupt(RC_INPUT_PIN), rcISR, CHANGE);
 
     throttleServo.attach(SERVO_PIN, SERVO_MIN_US, SERVO_MAX_US);
     throttleServo.writeMicroseconds(SERVO_NEUTRAL);
@@ -157,7 +167,7 @@ void setup()
     }
     Serial.println(F("Magnet detected. Starting cruise control."));
 
-    readAngle(prevAngle);
+    readAngle(lastSampledAngle);
     prevTimeMs = millis();
 
     // Print CSV header for Serial Plotter / logger
@@ -171,10 +181,25 @@ void setup()
 
 void loop()
 {
+    // --- High-frequency angle sampling (runs every loop iteration, no rate gate) ---
+    // Each sample only spans ~150-200 µs so deltas are tiny and never alias,
+    // no matter how fast the shaft spins. Deltas accumulate into accumulatedCounts
+    // and are drained once per control tick below.
+    {
+        uint16_t sampledAngle;
+        if (readAngle(sampledAngle)) {
+            int16_t delta = (int16_t)sampledAngle - (int16_t)lastSampledAngle;
+            if (delta >  2048) delta -= 4096;
+            if (delta < -2048) delta += 4096;
+            accumulatedCounts += delta;
+            lastSampledAngle = sampledAngle;
+        }
+    }
 
-    // Read R/C input pulse width (in microseconds)
-    int pulse = pulseIn(RC_INPUT_PIN, HIGH, 25000); // 25ms timeout
-    if (pulse > 900) rcPulseUs = pulse; // ignore timeouts
+    // Atomically snapshot the RC pulse captured by the interrupt
+    noInterrupts();
+    rcPulseUs = rcPulseRaw;
+    interrupts();
 
     // Map RC input to target RPM (1520 µs → 100 RPM, 2000 µs → 150 RPM)
     {
@@ -202,16 +227,10 @@ void loop()
 
     if (elapsed < LOOP_MS) return;  // wait for next control tick
 
-    uint16_t currentAngle = 0;
-    if (!readAngle(currentAngle)) {
-        Serial.println(F("ERROR: I2C read failed"));
-        return;
-    }
-
-    // Compute speed
-    measuredRPM = computeRPM(currentAngle, prevAngle, (float)elapsed);
-    prevAngle   = currentAngle;
-    prevTimeMs  = now;
+    // Drain the accumulator — RPM is now immune to aliasing regardless of speed
+    measuredRPM       = computeRPM(accumulatedCounts, (float)elapsed);
+    accumulatedCounts = 0;
+    prevTimeMs        = now;
 
     // Proportional controller (only when enabled)
 
@@ -244,16 +263,19 @@ void loop()
     int filteredPulseInt = (int)(slewedPulseUs + 0.5f);
     throttleServo.writeMicroseconds(filteredPulseInt);
 
-    // Serial telemetry (CSV, compatible with Serial Plotter)
-    Serial.print(controlEnabled ? 1 : 0);
-    Serial.print(',');
-    Serial.print(targetRPM, 1);
-    Serial.print(',');
-    Serial.print(measuredRPM, 1);
-    Serial.print(',');
-    Serial.print(filteredPulseInt);
-    Serial.print(',');
-    Serial.println(rcPulseUs);
+    // Serial telemetry (CSV, compatible with Serial Plotter) — throttled to SERIAL_MS
+    if (now - prevSerialMs >= SERIAL_MS) {
+        prevSerialMs = now;
+        Serial.print(controlEnabled ? 1 : 0);
+        Serial.print(',');
+        Serial.print(targetRPM, 1);
+        Serial.print(',');
+        Serial.print(measuredRPM, 1);
+        Serial.print(',');
+        Serial.print(filteredPulseInt);
+        Serial.print(',');
+        Serial.println(rcPulseUs);
+    }
 
     // Handle Serial commands:
     //   s<value>  → set target RPM   (e.g. "s120.5")
