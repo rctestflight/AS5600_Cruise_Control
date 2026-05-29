@@ -28,7 +28,7 @@ static const uint8_t AS5600_REG_ANGLE  = 0x0C;  // 0x0C (high), 0x0D (low)
 // ---------------------------------------------------------------------------
 static const uint8_t SERVO_PIN      = 5;
 static const int     SERVO_MIN_US   = 1590;  // 1615 for danchee
-static const int     SERVO_MAX_US   = 1750;  // 1650 for danchee
+static const int     SERVO_MAX_US   = 1760;  // 1650 for danchee
 static const int     SERVO_NEUTRAL  = 1500;  //  neutral 
 
 // ---------------------------------------------------------------------------
@@ -45,7 +45,7 @@ static const float   TARGET_RPM_MAX  = 5000.0f; // RPM at RC_RPM_MAX_US - 150 fo
 // ---------------------------------------------------------------------------
 // Controller tuning
 // ---------------------------------------------------------------------------
-float Kp             = 0.5f;   // proportional gain (µs per RPM of error)
+float Kp             = 1.0f;   // proportional gain (µs per RPM of error)
 float targetRPM      = TARGET_RPM_MIN;  // cruise setpoint (RPM), updated each loop from RC input
 
 // ---------------------------------------------------------------------------
@@ -73,7 +73,7 @@ const float FILTER_ALPHA = 1.0f; // 0.0 = no response, 1.0 = no filtering
 
 // Slew rate limiter on servo output
 // Maximum rate of change of the servo pulse width in µs per millisecond.
-static const float SLEW_RATE_MAX_US_PER_MS = 100.0f;  // 0.035 for dancehh - µs/ms — tune as needed
+static const float SLEW_RATE_MAX_US_PER_MS = 1.0f;  // 0.035 for danchee - µs/ms — tune as needed
 float slewedPulseUs = SERVO_NEUTRAL;
 
 // R/C input state — captured by interrupt, never by blocking pulseIn
@@ -272,24 +272,10 @@ void loop()
         Serial.print(',');
         Serial.print(measuredRPM, 1);
         Serial.print(',');
-        Serial.print(filteredPulseInt);
+        Serial.print(filteredPulseInt); // Throttle Output
         Serial.print(',');
-        Serial.println(rcPulseUs);
+        Serial.println(rcPulseUs); // R/C input
     }
 
-    // Handle Serial commands:
-    //   s<value>  → set target RPM   (e.g. "s120.5")
-    //   k<value>  → set Kp gain      (e.g. "k3.0")
-    while (Serial.available()) {
-        char cmd = Serial.read();
-        if (cmd == 's' || cmd == 'S') {
-            targetRPM = Serial.parseFloat();
-            Serial.print(F("Target RPM set to: "));
-            Serial.println(targetRPM, 1);
-        } else if (cmd == 'k' || cmd == 'K') {
-            Kp = Serial.parseFloat();
-            Serial.print(F("Kp set to: "));
-            Serial.println(Kp, 3);
-        }
-    }
+
 }
